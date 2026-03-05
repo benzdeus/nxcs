@@ -28,12 +28,43 @@ ANSI_COLORS = {
     '93': (255, 255, 165), '94': (214, 172, 255), '95': (255, 146, 223),
     '96': (164, 255, 255), '97': (255, 255, 255),
 }
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+KNOWN_PROTOCOLS = {
+    "SMB", "LDAP", "WINRM", "WMI", "SSH", "FTP", "MSSQL", "RDP", "NFS", "VNC", "HTTP", "RDP"
+}
 
-def get_font():
-    # Prefer fonts that can render Thai correctly across OSes.
-    font_paths = [
-        # Bundled with this repository (portable default)
+def contains_thai(text):
+    return any("\u0E00" <= ch <= "\u0E7F" for ch in text)
+
+
+def get_fonts():
+    # Keep table alignment with monospaced fonts, and use a dedicated Thai font for Thai glyphs.
+    mono_font_paths = [
+        # Bundled monospace options (if provided)
+        os.path.join(BASE_DIR, "fonts", "CascadiaMono.ttf"),
+        os.path.join(BASE_DIR, "fonts", "JetBrainsMono-Regular.ttf"),
+        # Windows
+        r"C:\Windows\Fonts\consola.ttf",
+        r"C:\Windows\Fonts\cour.ttf",
+        r"C:\Windows\Fonts\CascadiaMono.ttf",
+        # Linux / Kali
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/hack/Hack-Regular.ttf",
+        # macOS
+        "/System/Library/Fonts/SFNSMono.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Monaco.ttf",
+        "/Library/Fonts/Courier New.ttf",
+    ]
+    thai_font_paths = [
+        # Bundled with this repository (portable Thai support)
+        os.path.join(BASE_DIR, "fonts", "NotoSansThai-Regular.ttf"),
         os.path.join(BASE_DIR, "fonts", "NotoSansThai-Variable.ttf"),
+        os.path.join(BASE_DIR, "fonts", "NotoSansThaiLooped-Variable.ttf"),
+        # Optional bundled Thai monospaced font
+        os.path.join(BASE_DIR, "fonts", "TlwgMono.ttf"),
+        os.path.join(BASE_DIR, "fonts", "tlwgmono.ttf"),
         # Windows
         r"C:\Windows\Fonts\LeelawUI.ttf",
         r"C:\Windows\Fonts\LeelUIsl.ttf",
@@ -44,23 +75,31 @@ def get_font():
         "/usr/share/fonts/truetype/noto/NotoSansThaiUI-Regular.ttf",
         "/usr/share/fonts/truetype/thai-tlwg/Garuda.ttf",
         "/usr/share/fonts/truetype/thai-tlwg/TlwgMono.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/truetype/hack/Hack-Regular.ttf",
         # macOS
         "/System/Library/Fonts/Supplemental/Thonburi.ttf",
         "/System/Library/Fonts/Supplemental/SukhumvitSet.ttc",
-        "/System/Library/Fonts/Menlo.ttc",
-        "/System/Library/Fonts/Monaco.ttf",
-        "/Library/Fonts/Courier New.ttf",
     ]
-    for p in font_paths:
+    mono_font = None
+    thai_font = None
+    for p in mono_font_paths:
         if os.path.exists(p):
             try:
-                return ImageFont.truetype(p, 14)
+                mono_font = ImageFont.truetype(p, 14)
+                break
             except Exception:
                 continue
-    return ImageFont.load_default()
+    for p in thai_font_paths:
+        if os.path.exists(p):
+            try:
+                thai_font = ImageFont.truetype(p, 14)
+                break
+            except Exception:
+                continue
+    if mono_font is None:
+        mono_font = ImageFont.load_default()
+    if thai_font is None:
+        thai_font = mono_font
+    return mono_font, thai_font
 
 
 def decode_bytes(data):
@@ -75,7 +114,52 @@ def decode_bytes(data):
             continue
     return data.decode("utf-8", errors="replace")
 
-def draw_colored_text(draw, text, font, x_start, y_start):
+
+def apply_fallback_ansi(text):
+    # NetExec via subprocess on Windows often emits plain text without ANSI.
+    colorized = []
+    for line in text.splitlines():
+        updated = line
+        has_ansi = bool(ANSI_ESCAPE_RE.search(updated))
+
+        if not has_ansi:
+            protocol_match = re.match(r"^([A-Z0-9]{2,10})(\s+)", updated)
+            if protocol_match and protocol_match.group(1) in KNOWN_PROTOCOLS:
+                proto = protocol_match.group(1)
+                spacing = protocol_match.group(2)
+                updated = f"\x1b[34m{proto}\x1b[0m{spacing}" + updated[protocol_match.end():]
+
+            updated = re.sub(r"(\[\+\])", lambda m: f"\x1b[32m{m.group(1)}\x1b[0m", updated)
+            updated = re.sub(r"(\[-\])", lambda m: f"\x1b[31m{m.group(1)}\x1b[0m", updated)
+            updated = re.sub(r"(\[\*\])", lambda m: f"\x1b[34m{m.group(1)}\x1b[0m", updated)
+            updated = re.sub(r"\b(READ,WRITE|READ|WRITE)\b", lambda m: f"\x1b[33m{m.group(1)}\x1b[0m", updated)
+
+        colorized.append(updated)
+    return "\n".join(colorized)
+
+def is_thai_char(ch):
+    return "\u0E00" <= ch <= "\u0E7F"
+
+
+def split_script_runs(text):
+    if not text:
+        return []
+    runs = []
+    buf = [text[0]]
+    current_is_thai = is_thai_char(text[0])
+    for ch in text[1:]:
+        ch_is_thai = is_thai_char(ch)
+        if ch_is_thai == current_is_thai:
+            buf.append(ch)
+        else:
+            runs.append(("".join(buf), current_is_thai))
+            buf = [ch]
+            current_is_thai = ch_is_thai
+    runs.append(("".join(buf), current_is_thai))
+    return runs
+
+
+def draw_colored_text(draw, text, mono_font, thai_font, x_start, y_start):
     parts = re.split(r'(\x1b\[[0-9;]*m)', text)
     current_color = ANSI_COLORS['0']
     x = x_start
@@ -89,37 +173,51 @@ def draw_colored_text(draw, text, font, x_start, y_start):
                     current_color = ANSI_COLORS['0']
         else:
             if part:
-                draw.text((x, y_start), part, font=font, fill=current_color)
-                try:
-                    w = font.getlength(part)
-                except Exception:
-                    w = font.getsize(part)[0]
-                x += w
+                for run_text, run_is_thai in split_script_runs(part):
+                    run_font = thai_font if run_is_thai else mono_font
+                    draw.text((x, y_start), run_text, font=run_font, fill=current_color)
+                    try:
+                        w = run_font.getlength(run_text)
+                    except Exception:
+                        w = run_font.getsize(run_text)[0]
+                    x += w
+
+
+def line_width(line, mono_font, thai_font):
+    width = 0
+    for run_text, run_is_thai in split_script_runs(line):
+        run_font = thai_font if run_is_thai else mono_font
+        try:
+            width += run_font.getlength(run_text)
+        except Exception:
+            width += run_font.getsize(run_text)[0]
+    return width
 
 def text_to_image_color(text, output_filename):
     if not text.strip():
         return
+    text = apply_fallback_ansi(text)
     lines = text.splitlines()
-    font = get_font()
-    ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
+    mono_font, thai_font = get_fonts()
+
     max_width = 0
     for line in lines:
-        clean_line = ansi_escape.sub('', line)
-        try:
-            w = font.getlength(clean_line)
-        except Exception:
-            w = font.getsize(clean_line)[0]
+        clean_line = ANSI_ESCAPE_RE.sub('', line)
+        w = line_width(clean_line, mono_font, thai_font)
         if w > max_width:
             max_width = w
 
-    line_height = font.getbbox("Ag")[3] - font.getbbox("Ag")[1] + 4
+    line_height = max(
+        mono_font.getbbox("Ag")[3] - mono_font.getbbox("Ag")[1],
+        thai_font.getbbox("กิ")[3] - thai_font.getbbox("กิ")[1],
+    ) + 4
     img_width = int(max_width) + 60
     img_height = (len(lines) * line_height) + 40
     image = Image.new("RGB", (img_width, img_height), color=(40, 42, 54))
     draw = ImageDraw.Draw(image)
     y_text = 20
     for line in lines:
-        draw_colored_text(draw, line, font, 30, y_text)
+        draw_colored_text(draw, line, mono_font, thai_font, 30, y_text)
         y_text += line_height
     image.save(output_filename)
 
@@ -152,6 +250,11 @@ if __name__ == "__main__":
     my_env["CLICOLOR_FORCE"] = "1"
     my_env["FORCE_COLOR"] = "1"
     my_env["TERM"] = "xterm-256color"
+    # Force UTF-8 output from Python-based tools (including nxc) when possible.
+    my_env["PYTHONUTF8"] = "1"
+    my_env["PYTHONIOENCODING"] = "utf-8"
+    my_env["LANG"] = "C.UTF-8"
+    my_env["LC_ALL"] = "C.UTF-8"
 
     raw_args = sys.argv[1:]
     target_str = None
