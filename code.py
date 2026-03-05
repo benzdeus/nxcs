@@ -5,10 +5,12 @@ import re
 import os
 import ipaddress
 import concurrent.futures
+import locale
 from PIL import Image, ImageDraw, ImageFont
 
 # --- Config ---
 MAX_THREADS = 20
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- Color Mapping (ANSI to RGB) ---
 ANSI_COLORS = {
@@ -28,21 +30,50 @@ ANSI_COLORS = {
 }
 
 def get_font():
-    # รายชื่อ Font สำหรับ Linux และ macOS
+    # Prefer fonts that can render Thai correctly across OSes.
     font_paths = [
+        # Bundled with this repository (portable default)
+        os.path.join(BASE_DIR, "fonts", "NotoSansThai-Variable.ttf"),
+        # Windows
+        r"C:\Windows\Fonts\LeelawUI.ttf",
+        r"C:\Windows\Fonts\LeelUIsl.ttf",
+        r"C:\Windows\Fonts\tahoma.ttf",
+        r"C:\Windows\Fonts\THSarabunNew.ttf",
         # Linux / Kali
+        "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansThaiUI-Regular.ttf",
+        "/usr/share/fonts/truetype/thai-tlwg/Garuda.ttf",
+        "/usr/share/fonts/truetype/thai-tlwg/TlwgMono.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
         "/usr/share/fonts/truetype/hack/Hack-Regular.ttf",
         # macOS
+        "/System/Library/Fonts/Supplemental/Thonburi.ttf",
+        "/System/Library/Fonts/Supplemental/SukhumvitSet.ttc",
         "/System/Library/Fonts/Menlo.ttc",
         "/System/Library/Fonts/Monaco.ttf",
-        "/Library/Fonts/Courier New.ttf"
+        "/Library/Fonts/Courier New.ttf",
     ]
     for p in font_paths:
         if os.path.exists(p):
-            return ImageFont.truetype(p, 14)
+            try:
+                return ImageFont.truetype(p, 14)
+            except Exception:
+                continue
     return ImageFont.load_default()
+
+
+def decode_bytes(data):
+    # Try common encodings in order; cp874 covers Thai legacy codepages.
+    if data is None:
+        return ""
+    encodings = ["utf-8", "cp874", locale.getpreferredencoding(False)]
+    for enc in encodings:
+        try:
+            return data.decode(enc)
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 def draw_colored_text(draw, text, font, x_start, y_start):
     parts = re.split(r'(\x1b\[[0-9;]*m)', text)
@@ -52,35 +83,44 @@ def draw_colored_text(draw, text, font, x_start, y_start):
         if part.startswith('\x1b['):
             codes = part.strip('\x1b[m').split(';')
             for code in codes:
-                if code in ANSI_COLORS: current_color = ANSI_COLORS[code]
-                elif code == '0': current_color = ANSI_COLORS['0']
+                if code in ANSI_COLORS:
+                    current_color = ANSI_COLORS[code]
+                elif code == '0':
+                    current_color = ANSI_COLORS['0']
         else:
             if part:
                 draw.text((x, y_start), part, font=font, fill=current_color)
-                try: w = font.getlength(part)
-                except: w = font.getsize(part)[0]
+                try:
+                    w = font.getlength(part)
+                except Exception:
+                    w = font.getsize(part)[0]
                 x += w
 
 def text_to_image_color(text, output_filename):
-    if not text.strip(): return
+    if not text.strip():
+        return
     lines = text.splitlines()
     font = get_font()
     ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
     max_width = 0
     for line in lines:
         clean_line = ansi_escape.sub('', line)
-        try: w = font.getlength(clean_line)
-        except: w = font.getsize(clean_line)[0]
-        if w > max_width: max_width = w
-            
+        try:
+            w = font.getlength(clean_line)
+        except Exception:
+            w = font.getsize(clean_line)[0]
+        if w > max_width:
+            max_width = w
+
+    line_height = font.getbbox("Ag")[3] - font.getbbox("Ag")[1] + 4
     img_width = int(max_width) + 60
-    img_height = (len(lines) * 18) + 40
+    img_height = (len(lines) * line_height) + 40
     image = Image.new("RGB", (img_width, img_height), color=(40, 42, 54))
     draw = ImageDraw.Draw(image)
     y_text = 20
     for line in lines:
         draw_colored_text(draw, line, font, 30, y_text)
-        y_text += 18
+        y_text += line_height
     image.save(output_filename)
 
 def clean_ansi(text):
@@ -91,20 +131,22 @@ def scan_single_host(ip, base_args, target_index, folder_name, env_vars):
     current_args[target_index] = str(ip)
     cmd = ["nxc"] + current_args
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env_vars)
-        raw_output = result.stdout + result.stderr
+        result = subprocess.run(cmd, capture_output=True, text=False, env=env_vars)
+        raw_output = decode_bytes(result.stdout) + decode_bytes(result.stderr)
         clean_output = clean_ansi(raw_output)
-        if not clean_output.strip() or "Connection refused" in clean_output: return None
+        if not clean_output.strip() or "Connection refused" in clean_output:
+            return None
         filename = os.path.join(folder_name, f"{ip}.png")
         text_to_image_color(raw_output, filename)
         return f"[+] Saved: {filename}"
-    except Exception as e: return f"[-] Error {ip}: {e}"
+    except Exception as e:
+        return f"[-] Error {ip}: {e}"
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: nxcs <protocol> <target> [options]")
         sys.exit(1)
-    
+
     # Environment Setup
     my_env = os.environ.copy()
     my_env["CLICOLOR_FORCE"] = "1"
@@ -128,39 +170,49 @@ if __name__ == "__main__":
     if is_subnet:
         print(f"[*] Subnet Mode: {target_str}")
         folder_name = target_str.replace('/', '_')
-        if not os.path.exists(folder_name): os.makedirs(folder_name)
+        if not os.path.exists(folder_name):
+            os.makedirs(folder_name)
 
         print("[*] Discovery Phase: Running original command...")
         discovery_cmd = ["nxc"] + raw_args
         try:
-            disc_res = subprocess.run(discovery_cmd, capture_output=True, text=True, env=my_env)
-            disc_out_clean = clean_ansi(disc_res.stdout + disc_res.stderr)
+            disc_res = subprocess.run(discovery_cmd, capture_output=True, text=False, env=my_env)
+            disc_raw = decode_bytes(disc_res.stdout) + decode_bytes(disc_res.stderr)
+            disc_out_clean = clean_ansi(disc_raw)
         except Exception as e:
-            print(f"[-] Discovery Failed: {e}"); sys.exit(1)
+            print(f"[-] Discovery Failed: {e}")
+            sys.exit(1)
 
-        try: target_net = ipaddress.ip_network(target_str, strict=False)
-        except ValueError: print(f"[-] Invalid Network: {target_str}"); sys.exit(1)
+        try:
+            target_net = ipaddress.ip_network(target_str, strict=False)
+        except ValueError:
+            print(f"[-] Invalid Network: {target_str}")
+            sys.exit(1)
 
         all_potential_ips = set(re.findall(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", disc_out_clean))
         valid_hosts = []
         for ip_str in all_potential_ips:
             try:
                 ip_obj = ipaddress.ip_address(ip_str)
-                if ip_obj in target_net: valid_hosts.append(str(ip_obj))
-            except ValueError: continue
+                if ip_obj in target_net:
+                    valid_hosts.append(str(ip_obj))
+            except ValueError:
+                continue
         valid_hosts = sorted(valid_hosts, key=lambda ip: int(ipaddress.ip_address(ip)))
 
         if not valid_hosts:
-            print(f"[-] No valid hosts found in {target_str}"); sys.exit(0)
+            print(f"[-] No valid hosts found in {target_str}")
+            sys.exit(0)
 
         print(f"[*] Found {len(valid_hosts)} hosts. Generating colored images...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             futures = {executor.submit(scan_single_host, ip, raw_args, target_index, folder_name, my_env): ip for ip in valid_hosts}
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
-                if result: print(result)
-        print("[🎉] All done.")
+                if result:
+                    print(result)
+        print("[*] All done.")
     else:
         print(f"[*] Single Host: {target_str}")
         scan_single_host(target_str, raw_args, target_index, ".", my_env)
-        print(f"[+] Done.")
+        print("[+] Done.")
